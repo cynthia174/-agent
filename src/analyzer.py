@@ -28,6 +28,10 @@ COLUMN_ALIASES = {
 }
 DIMENSIONS = ["产品类别", "客户类型", "地区", "产品"]
 MAX_ATTEMPTS = 3
+KNOWN_FILTER_VALUES = {
+    "地区": ["华东", "华南", "华北", "西南", "华中"],
+    "客户类型": ["新客户", "老客户", "企业客户"],
+}
 
 
 @dataclass
@@ -127,9 +131,16 @@ def _local_plan(question: str) -> dict[str, Any]:
         metric = "销售额"
 
     aggregation = "mean" if any(k in q for k in ["平均", "均值"]) else "sum"
+    order = "asc" if any(k in q for k in ["最低", "最少", "最小"]) else "desc"
+    filters = {
+        field: value
+        for field, values in KNOWN_FILTER_VALUES.items()
+        for value in values
+        if value in question
+    }
     if any(k in q for k in ["趋势", "变化"]) and dimension == "月份":
         intent = "trend"
-    elif any(k in q for k in ["最高", "最多", "排名", "前三", "前五", "top"]):
+    elif any(k in q for k in ["最高", "最低", "最多", "最少", "排名", "前三", "前五", "top"]):
         intent = "ranking"
         dimension = dimension or "产品"
     elif dimension and any(k in q for k in ["各", "分别", "对比", "比较", "分布", "图"]):
@@ -141,6 +152,8 @@ def _local_plan(question: str) -> dict[str, Any]:
         "metric": metric,
         "dimension": dimension,
         "aggregation": aggregation,
+        "order": order,
+        "filters": filters,
         "top_n": _detect_top_n(question),
         "chart": wants_chart,
         "source": "本地演示模式",
@@ -156,8 +169,9 @@ def _ask_llm_for_plan(
 ) -> dict[str, Any]:
     prompt = f"""你只负责制定数据分析计划，不得回答数字。只能返回 JSON。
 intent 只能是 total/ranking/breakdown/trend；metric 只能是 销售额/成本/数量/利润/折扣；
-dimension 只能是 地区/产品/产品类别/客户类型/月份/null；aggregation 只能是 sum/mean。
-格式：{{"intent":"ranking","metric":"销售额","dimension":"产品","aggregation":"sum","top_n":3,"chart":false}}
+dimension 只能是 地区/产品/产品类别/客户类型/月份/null；aggregation 只能是 sum/mean；
+order 只能是 asc/desc；filters 只能使用 地区、客户类型，例如 {{"地区":"华东"}}。
+格式：{{"intent":"ranking","metric":"销售额","dimension":"产品","aggregation":"sum","order":"desc","filters":{{}},"top_n":3,"chart":false}}
 数据列：{columns}
 问题：{question}"""
     response = requests.post(
@@ -183,7 +197,17 @@ def _validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"数据中不存在分组字段：{plan.get('dimension')}")
     if plan.get("aggregation", "sum") not in {"sum", "mean"}:
         raise ValueError(f"不支持的汇总方法：{plan.get('aggregation')}")
+    if plan.get("order", "desc") not in {"asc", "desc"}:
+        raise ValueError(f"不支持的排序方向：{plan.get('order')}")
+    filters = plan.get("filters") or {}
+    if not isinstance(filters, dict):
+        raise ValueError("筛选条件必须是字段和值的对应关系")
+    for field, value in filters.items():
+        if field not in KNOWN_FILTER_VALUES or value not in KNOWN_FILTER_VALUES[field]:
+            raise ValueError(f"不支持的筛选条件：{field}={value}")
     plan["aggregation"] = plan.get("aggregation", "sum")
+    plan["order"] = plan.get("order", "desc")
+    plan["filters"] = filters
     plan["top_n"] = max(1, min(int(plan.get("top_n", 1)), 20))
     plan["chart"] = bool(plan.get("chart", False))
     return plan
@@ -192,9 +216,12 @@ def _validate_plan(plan: dict[str, Any]) -> dict[str, Any]:
 def _plan_text(plan: dict[str, Any], time_label: str) -> str:
     op = "求平均值" if plan["aggregation"] == "mean" else "求和"
     dimension = plan.get("dimension") or "不分组"
+    filters = plan.get("filters") or {}
+    filter_text = "、".join(f"{k}={v}" for k, v in filters.items()) or "无额外筛选"
+    order_text = "从低到高" if plan.get("order") == "asc" else "从高到低"
     return (
         f"筛选{time_label}；指标是“{plan['metric']}”；按“{dimension}”处理；"
-        f"计算方法是{op}；分析类型是 {plan['intent']}。"
+        f"计算方法是{op}；筛选条件：{filter_text}；排序：{order_text}；分析类型是 {plan['intent']}。"
     )
 
 
@@ -213,6 +240,13 @@ def _execute_plan(
 ) -> tuple[str, str, pd.DataFrame | None]:
     plan = _validate_plan(dict(plan))
     work = filtered.copy()
+    filter_parts: list[str] = []
+    for field, value in plan["filters"].items():
+        before = len(work)
+        work = work[work[field] == value]
+        filter_parts.append(f"{field}={value}")
+        if work.empty:
+            raise ValueError(f"筛选“{field}={value}”后没有数据（筛选前 {before} 条）")
     if plan["metric"] == "利润":
         work["利润"] = work["销售额"] - work["成本"]
     if plan["dimension"] == "月份":
@@ -222,6 +256,7 @@ def _execute_plan(
     dimension = plan.get("dimension")
     aggregation = plan["aggregation"]
     intent = plan["intent"]
+    filter_note = f"，筛选条件为{'、'.join(filter_parts)}" if filter_parts else ""
 
     if intent == "total":
         value = float(getattr(work[metric], aggregation)())
@@ -229,8 +264,8 @@ def _execute_plan(
             raise ValueError("计算结果不是有效数字")
         op = "平均值" if aggregation == "mean" else "合计"
         answer = f"{time_label}的{metric}{op}为 {_format_value(metric, value)}。"
-        evidence = f"使用 {len(work):,} 条订单，对“{metric}”列执行{'平均值' if aggregation == 'mean' else '求和'}。"
-        return answer, evidence, None
+        evidence = f"使用 {len(work):,} 条订单{filter_note}，对“{metric}”列执行{'平均值' if aggregation == 'mean' else '求和'}。"
+        return answer, evidence, pd.DataFrame([{"范围": time_label, metric: value}])
 
     if not dimension or dimension not in work.columns:
         raise ValueError(f"无法按“{dimension}”分组：数据里没有这个字段")
@@ -244,25 +279,27 @@ def _execute_plan(
     if intent == "trend":
         table = grouped.sort_values(dimension).reset_index(drop=True)
         answer = f"已算出{time_label}{metric}的月度趋势，共 {len(table)} 个月。"
-        evidence = f"使用 {len(work):,} 条订单，提取订单月份后按月对“{metric}”执行求和。"
+        evidence = f"使用 {len(work):,} 条订单{filter_note}，提取订单月份后按月对“{metric}”执行求和。"
     elif intent == "ranking":
-        table = grouped.sort_values(metric, ascending=False).head(plan["top_n"]).reset_index(drop=True)
+        ascending = plan["order"] == "asc"
+        table = grouped.sort_values(metric, ascending=ascending).head(plan["top_n"]).reset_index(drop=True)
         best = table.iloc[0]
+        rank_word = "最低" if ascending else "最高"
         answer = (
-            f"{time_label}{metric}最高的{dimension}是“{best[dimension]}”，"
+            f"{time_label}{metric}{rank_word}的{dimension}是“{best[dimension]}”，"
             f"{metric}为 {_format_value(metric, float(best[metric]))}。"
         )
         if plan["top_n"] > 1:
             answer += f"结果表展示前 {len(table)} 名。"
         evidence = (
-            f"使用 {len(work):,} 条订单，按“{dimension}”分组，对“{metric}”执行"
-            f"{'平均值' if aggregation == 'mean' else '求和'}，再从高到低排序。"
+            f"使用 {len(work):,} 条订单{filter_note}，按“{dimension}”分组，对“{metric}”执行"
+            f"{'平均值' if aggregation == 'mean' else '求和'}，再{'从低到高' if ascending else '从高到低'}排序。"
         )
     else:
-        table = grouped.sort_values(metric, ascending=False).reset_index(drop=True)
+        table = grouped.sort_values(metric, ascending=plan["order"] == "asc").reset_index(drop=True)
         answer = f"已完成{time_label}不同{dimension}的{metric}对比，共 {len(table)} 组。"
         evidence = (
-            f"使用 {len(work):,} 条订单，按“{dimension}”分组，对“{metric}”执行"
+            f"使用 {len(work):,} 条订单{filter_note}，按“{dimension}”分组，对“{metric}”执行"
             f"{'平均值' if aggregation == 'mean' else '求和'}。"
         )
     if table[metric].isna().any():

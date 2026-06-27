@@ -9,3 +9,4 @@ charts/*.html
 charts/*.png
 !charts/.gitkeep
 *.inspect.ndjson
+evaluation/results/evaluation_*

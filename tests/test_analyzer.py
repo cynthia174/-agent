@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from src.analyzer import analyze_question, load_sales_data
+from evaluation.evaluator import run_evaluation
 
 
 ROOT = Path(__file__).parents[1]
@@ -164,3 +165,33 @@ def test_agent_recovers_after_first_error(sales, tmp_path):
     assert any(step["status"] == "失败" for step in result.steps)
     assert any(step["status"] == "已修正" for step in result.steps)
     assert len(result.steps) <= 10
+
+
+def test_lowest_product_is_exact(sales, tmp_path):
+    result = analyze_question(sales, "哪个产品营收最低？", tmp_path)
+    expected = sales.groupby("产品")["销售额"].sum().idxmin()
+    assert result.table.iloc[0]["产品"] == expected
+    assert "最低" in result.answer
+
+
+def test_region_filter_is_applied(sales, tmp_path):
+    result = analyze_question(sales, "2024年华东地区总营收是多少？", tmp_path)
+    expected = sales[
+        (sales["订单日期"].dt.year == 2024) & (sales["地区"] == "华东")
+    ]["销售额"].sum()
+    assert result.table.iloc[0]["销售额"] == pytest.approx(expected)
+    assert "地区=华东" in result.calculation
+
+
+def test_full_evaluation_scores_all_questions(sales, tmp_path):
+    report = run_evaluation(
+        sales,
+        output_dir=tmp_path / "results",
+        chart_dir=tmp_path / "charts",
+    )
+    assert report["summary"]["总题数"] >= 10
+    assert report["summary"]["通过题数"] == report["summary"]["总题数"]
+    assert report["summary"]["准确率"] == 100
+    assert Path(report["csv_path"]).exists()
+    assert Path(report["json_path"]).exists()
+    assert Path(report["report_path"]).exists()

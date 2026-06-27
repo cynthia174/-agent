@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+from evaluation.evaluator import QUESTION_BANK, run_evaluation
 from src.analyzer import analyze_question, load_sales_data
 
 
@@ -129,3 +130,42 @@ if st.button("开始分析", type="primary", use_container_width=True):
     except Exception as exc:
         st.error(f"这次分析没有完成：{exc}")
         st.info("请换一种更明确的问法，例如：“2025年各地区销售额是多少？”")
+
+st.divider()
+st.subheader("🧪 自动评测")
+st.caption(f"题库共 {len(QUESTION_BANK)} 道题，覆盖总数、排名、地区、产品、月份、客户、折扣、利润、筛选和图表。")
+with st.expander("查看考试题目"):
+    st.dataframe(
+        pd.DataFrame(QUESTION_BANK)[["id", "type", "question"]].rename(
+            columns={"id": "题号", "type": "类型", "question": "问题"}
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+if st.button("运行完整自动评测", use_container_width=True):
+    try:
+        with st.spinner("正在逐题提问、计算标准答案并自动判分……"):
+            evaluation = run_evaluation(
+                df,
+                output_dir=ROOT / "evaluation" / "results",
+                chart_dir=ROOT / "charts",
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+            )
+        summary = evaluation["summary"]
+        st.success(
+            f"评测完成：{summary['通过题数']}/{summary['总题数']} 通过，"
+            f"准确率 {summary['准确率']:.1f}%"
+        )
+        if summary["失败题号"]:
+            st.error("失败题目：" + "、".join(summary["失败题号"]))
+        else:
+            st.info("所有题目均通过。")
+        st.dataframe(pd.DataFrame(evaluation["results"]), use_container_width=True, hide_index=True)
+        st.image(evaluation["score_chart_path"], caption="本次自动评测得分")
+        st.caption(f"逐题结果已保存：{evaluation['csv_path']}")
+        st.caption(f"完整过程已保存：{evaluation['json_path']}")
+    except Exception as exc:
+        st.error(f"自动评测没有完成：{type(exc).__name__}: {exc}")
