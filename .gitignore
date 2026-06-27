@@ -1,0 +1,11 @@
+.env
+.venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+streamlit.log
+streamlit-error.log
+charts/*.html
+charts/*.png
+!charts/.gitkeep
+*.inspect.ndjson
